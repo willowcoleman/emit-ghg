@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+2#! /usr/bin/env python
 #
 #  Copyright 2023 California Institute of Technology
 #  
@@ -36,6 +36,10 @@ from PIL import Image
 from IPython.display import Image, display
 from bresenham import bresenham
 import re
+import openmeteo_requests
+import requests_cache
+from retry_requests import retry
+from openmeteo_sdk.Variable import Variable
 
 def main(input_args=None):
     parser = argparse.ArgumentParser(description="Methane plume IME/Q calculation")
@@ -151,7 +155,7 @@ def main(input_args=None):
 
     # IME/Q Calculations 
     u10_avg, u10_std = access_era5(time, day, year, month, plume_lat, plume_lon, args.grib_path)
-    q_list, ime_list, min_radius = calc_q(plume_arr, full_path, u10_avg, u10_std, args.plume_id, x_source, y_source, conc_unc, args.plot, args.gif, args.plot_path)
+    q_list, ime_list, min_radius = calc_q(plume_arr, full_path, u10_avg, u10_std, args.plume_id, x_source, y_source, conc_unc, args.gif)
     
     print('Threshold:', str(min_radius))
     
@@ -170,6 +174,46 @@ def main(input_args=None):
 
     
 ######## FUNCTIONS ########
+
+def open_meteo_era5(plume_lat, plume_lon, date, hour_rounded): 
+    # Setup the Open-Meteo API client with cache and retry on error
+    cache_session = requests_cache.CachedSession('.cache', expire_after = -1)
+    retry_session = retry(cache_session, retries = 5, backoff_factor = 0.2)
+    openmeteo = openmeteo_requests.Client(session = retry_session)
+
+    # Call Open-Meteo API
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": [plume_lat-0.25, plume_lat, plume_lat+0.25, 
+                plume_lat-0.25, plume_lat, plume_lat+0.25, 
+                plume_lat-0.25, plume_lat, plume_lat+0.25],
+        "longitude": [plume_lon+0.25, plume_lon+0.25, plume_lon+0.25,
+                  plume_lon, plume_lon, plume_lon, 
+                  plume_lon-0.25, plume_lon-0.25, plume_lon-0.25],
+        "start_date": date,
+        "end_date": date,
+        "hourly": "wind_speed_10m",
+        "models": "best_match", 
+        "wind_speed_unit": "ms"
+    }
+    responses = openmeteo.weather_api(url, params=params)
+    
+    wind_list = []
+    for response in responses: 
+        hourly = response.Hourly()
+        hourly_time = range(hourly.Time(), hourly.TimeEnd(), hourly.Interval())
+        hourly_variables = list(map(lambda i: hourly.Variables(i), range(0, hourly.VariablesLength())))
+
+        # Extract hourly wind speed for specified hour 
+        hourly_wind_speed_10m = next(filter(lambda x: x.Variable() == Variable.wind_speed and x.Altitude() == 10, hourly_variables)).ValuesAsNumpy()
+        hour_ind = int(hour_rounded.split(":")[0])
+        wind_list.append(hourly_wind_speed_10m[hour_ind])
+    
+    u10_avg = np.abs(np.nanmean(wind_list))
+    u10_std = np.abs(np.nanstd(wind_list))
+    
+    return u10_avg, u10_std
+
     
 def access_era5(time, day, year, month, plume_lat, plume_lon, save_path): 
     """
@@ -182,7 +226,8 @@ def access_era5(time, day, year, month, plume_lat, plume_lon, save_path):
     fname = year + month + day + '_' + time + fname_ext
     fname = os.path.join(save_path, fname)
 
-    if not os.path.exists(fname): 
+    if not os.path.exists(fname):     
+        return
         print('Downloading new .grib file!')
     
         # Retrieve ERA5 from Climate Data Store (CDS) API 
@@ -334,6 +379,7 @@ def find_intersection(plume_arr, row_index, col_index):
     
     # Find plume contour line and slope 
     line_length, right_pt, left_pt = contour_plume_UPDATE(plume_arr, plot = False)
+        
     slope = (right_pt[1] - left_pt[1])/(right_pt[0] - left_pt[0])
     slope = -1/(slope + 10e-6)
     
@@ -363,7 +409,7 @@ def find_intersection(plume_arr, row_index, col_index):
 
     return intersection_points
 
-def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, conc_unc, plot, gif, plot_path, dst_srs = 'EPSG:3857'): 
+def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, conc_unc, gif, dst_srs = 'EPSG:3857'): 
     """
     plume_arr [float arr]: 2-D array of plume enhancement data [ppmm]
     plume_path [str]: filepath to plume enhancement data
@@ -371,7 +417,6 @@ def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, 
     x_source: x coordinate of plume source pixel
     y_source: y coordinate of plume source pixel
     conc_unc: scene-wise match-filter concentration uncertainty [ppmm] 
-    plot [boolean]: scatterplot of IME and Q values
     gif [boolean]: gif of orthogonally transected plume 
     
     q [float]: hourly plume emissions [kgCH4/hr]
@@ -477,68 +522,12 @@ def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, 
         thresh = plume_threshold_list[i]
         if radius > min_radius and thresh > 1: 
             min_radius = radius
-    
-    # # Get plume complex ID 
-    # complex_id = re.search(r'-(.*?)\.tif', os.path.split(plume_path)[-1]).group(1)
 
     if gif: 
         # Display animation of concentric circles 
         ani = animation.ArtistAnimation(fig, frames, interval=500, blit=True, repeat_delay=1000)
         ani.save(os.path.join(plot_path,  str(complex_id) + '_plume_ani.gif'))
         # display(Image(plot_path))
-        
-    if plot: 
-        
-        plt.rcParams['font.family'] = "serif"
-        
-        # fig1, (ax1, ax3) = plt.subplots(1,2, figsize = (10, 4))
-        fig1, ax1 = plt.subplots(1,1, figsize = (5,4))
-        
-        fig1.tight_layout(pad=7)
-        
-        # Plot IME/Q data
-        ax1.scatter(rad_list, q_list, color = 'blue')
-        ax1.set_xlabel('Plume length [m]')
-        ax1.set_ylabel('Q [kgCH4/hr]', color = 'blue')
-        ax1.tick_params(axis = 'y', labelcolor = 'blue')
-        ax2 = ax1.twinx()
-        ax2.scatter(rad_list, ime_list, color = 'r')
-        ax2.set_ylabel('IME [kg]', color = 'r')
-        ax2.tick_params(axis = 'y', labelcolor = 'r')
-        plt.savefig(os.path.join(plot_path, str(complex_id) + '_ime_q_scatter.png'), dpi=1200)
-        
-        ## Read in CNN bypass data 
-        cnn_df = pd.read_csv('/scratch/colemanr/emit-ghg/EMIT_plume_ime_CNN.csv')
-        
-        ime_200 = np.mean(cnn_df[cnn_df[' Candidate ID'] == ' CH4_PlumeComplex-' + str(complex_id)][' IME200 (kg)'])
-        # ax2.plot([200], [ime_200], marker='*', ls='none', color = 'r', ms=10)
-        
-        avg_ime_200 = np.mean(cnn_df[cnn_df[' Candidate ID'] == ' CH4_PlumeComplex-' + str(complex_id)][' AvgIMEdivFetch200 (kg/m)'])
-        stdev = np.mean(cnn_df[cnn_df[' Candidate ID'] == ' CH4_PlumeComplex-' + str(complex_id)][' StdIMEdivFetch200 (kg/m)'])
-        
-        ime_200 = np.mean(cnn_df[cnn_df[' Candidate ID'] == ' CH4_PlumeComplex-' + str(complex_id)][' IME200 (kg)'])
-        fetch_200 = np.mean(cnn_df[cnn_df[' Candidate ID'] == ' CH4_PlumeComplex-' + str(complex_id)][' Fetch200 (m)'])
-        
-        # Science Advances 2023
-#         ax1.axhline([(ime_200/fetch_200) * u10 * 3600], ls='solid', color = 'blue')
-#         ax1.axhline([(ime_200/fetch_200) * u10 * 3600 + (ime_200/fetch_200) * u10_std * 3600], ls='dashed', color = 'blue')
-#         ax1.axhline([(ime_200/fetch_200) * u10 * 3600 - (ime_200/fetch_200) * u10_std * 3600], ls='dashed', color = 'blue')
-        
-        # Duren Concentric Circles 2019
-        # ax1.axhline([avg_ime_200 * u10 * 3600], ls='solid', color = 'blue')
-        # ax1.axhline([avg_ime_200 * u10 * 3600 + stdev * 3600 * u10], ls='dashed', color = 'blue')
-        # ax1.axhline([avg_ime_200 * u10 * 3600 - stdev * 3600 * u10], ls='dashed', color = 'blue')
-        
-        # # Plot IME/Q uncertainty data
-        # # fig1, ax1 = plt.subplots()
-        # ax3.scatter(rad_list, plume_threshold_list, color = 'green')
-        # ax3.set_xlabel('Plume length [m]')
-        # ax3.set_ylabel('IME/IME Uncertainty')
-        # ax3.axhline(y=1, color = 'green', linestyle = 'dashed', linewidth = 2)
-        # # plt.savefig(os.path.join(plot_path, str(complex_id) + '_ime_q_scatter_unc.png'))
-        
-        plt.show()
-
 
     return q_list, ime_list, rad_list
 

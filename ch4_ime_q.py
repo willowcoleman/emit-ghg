@@ -1,6 +1,6 @@
-2#! /usr/bin/env python
+#! /usr/bin/env python
 #
-#  Copyright 2023 California Institute of Technology
+#  Copyright 2024 California Institute of Technology
 #  
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -25,17 +25,11 @@ import rasterio
 from osgeo import gdal
 import json
 import pandas as pd
-import xarray as xr
-import cdsapi
 from datetime import datetime, timedelta
 from time import time
 import cv2
 import math
-from matplotlib import animation
-from PIL import Image
-from IPython.display import Image, display
 from bresenham import bresenham
-import re
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
@@ -44,138 +38,105 @@ from openmeteo_sdk.Variable import Variable
 def main(input_args=None):
     parser = argparse.ArgumentParser(description="Methane plume IME/Q calculation")
     parser.add_argument('--plume_id', type=int, help='Methane plume ID number')
-    parser.add_argument('--out_path', type=str, default = '/beegfs/scratch/colemanr/emit-ghg/out/', nargs='?', help='Save path for output log file')
-    parser.add_argument('--out_name', type=str, default='save_data.txt', help='Name for output log file (.txt)')
-    parser.add_argument('--gif', action='store_true', help="Save plume orthogonal transect gif") 
-    parser.add_argument('--plot', action='store_true', help="Save IME/Q vs. plume length scatter plot")
-    parser.add_argument('--plot_path', type=str, help="Save path for gif/plot outputs") # Required if gif or plot
-    parser.add_argument('--grib_path', type=str, help='Save path for ERA-5 .grib file', default = '/beegfs/scratch/colemanr/emit-ghg/grib', nargs='?')
+    parser.add_argument('--dst_srs', type=str, default='EPSG:3857', help="??")
+    parser.add_argument('--method', type=str, default='transect', help="??")
+    parser.add_argument('--plume_path', type=str, default='/scratch/brodrick/methane/visions_delivery/', help="Path to delineated plume COGs")
+    parser.add_argument('--meta_path', type=str, default='/scratch/brodrick/methane/ch4_plumedir/previous_manual_annotation_oneback.json', help="Path to metadata json")
+    parser.add_argument('--mask_neg', action='store_true')
+    parser.add_argument('--plot', action='store_true', help="Save IME/Q vs. plume length scatter plot figure as pdf")
+    parser.add_argument('--plot_path', type=str, default='/scratch/colemanr/emit-ghg/ime_2024_manuscript/transect_figs/', help="Save path for pdf plot outputs") # Required if gif or plot
     args = parser.parse_args(input_args)
+
+    # Flags
+    if args.mask_neg: 
+        print('Masking out negative MF values')
     
     # Check for co-required arguments
-    if args.plot_path is None and args.gif:
-        parser.error("--gif and --plot_path must be given together")
     if args.plot_path is None and args.plot:
         parser.error("--plot and --plot_path must be given together")
         
     # Check that provided paths exist and create if they don't 
-    if not os.path.exists(args.out_path):
-        os.makedirs(args.out_path)
-        print("Directory '% s' created" % args.out_path) 
     if args.plot_path is not None and not os.path.exists(args.plot_path):
         os.makedirs(args.plot_path)
         print("Directory '% s' created" % args.plot_path) 
-    if not os.path.exists(args.grib_path):
-        os.makedirs(args.grib_path)
-        print("Directory '% s' created" % args.grib_path) 
-    
-    # Check that args.out_name is a .txt file and if it doesn't exist yet, create it
-    if os.path.splitext(args.out_name)[1] != '.txt':
-        parser.error("--out_name must be a .txt file")
-    if not os.path.isfile(os.path.join(args.out_path, args.out_name)):
-        with open(os.path.join(args.out_path, args.out_name), 'w') as f:
-            print("File '% s' created" % os.path.join(args.out_path, args.out_name))
-            f.write('')  
-    else: 
-        print("Appending data to existing file!") 
 
     ##########################################
 
-    # Path to delineated plume COGs
-    plume_path = '/scratch/brodrick/methane/visions_delivery/'
+    # Extract plume metadata 
+    full_plume_id = 'CH4_PlumeComplex-' + str(args.plume_id)
+    u10_avg, u10_std, x_source, y_source, full_path, plume_arr, _, _, _  = get_plume_metadata(full_plume_id, args.meta_path, args.plume_path)
 
-    # Path to plume metadata (.json) 
-    metadata_path = '/scratch/brodrick/methane/visions_delivery/combined_plume_metadata.json'
+    # IME/Q Calculations 
+    if args.method == 'transect':
+        p_s = pixel_size(full_path, args.dst_srs)
+        q_list, ime_list, rad_list = calc_q_transect(plume_arr, p_s, u10_avg, u10_std, x_source, y_source, args.mask_neg)
 
-    # Open plume metadata as nested json dict
-    f = open(metadata_path)
-    metadata = json.load(f)
-    plume_df = pd.json_normalize(metadata['features'])
+        if args.plot_path: 
+            create_plume_pdf(full_plume_id, args.meta_path, args.plot_path, args.plume_path, q_list, ime_list, rad_list)
+    else: 
+        print("This method is not implemented!")
+        return
 
-    # Open manual plume annotation for source pixels
-    metadata_path_annotation = '/scratch/brodrick/methane/ch4_plumedir/manual_annotation.json'
-    f = open(metadata_path_annotation)
-    meta = json.load(f)
-    meta_df = pd.json_normalize(meta['body']['geojson']['features'])
+######## HELPER FUNCTIONS ########
 
-    # Join meta_df (properties.name) and plume_df (properties.Plume ID) 
-    merge_df = pd.merge(plume_df, meta_df, left_on = 'properties.Plume ID', right_on = 'properties.name')
+def get_plume_metadata(curr_id, meta_path, plume_path):
 
-    # Remove duplicate plume metadata "Point" entries 
-    poly_df = merge_df[merge_df['geometry.type_x'] == 'Polygon']
-    plume_id_list = list(poly_df['properties.Plume ID'])
-    scene_fid_list = list(poly_df['properties.Scene FIDs'])
-    pseudo_o_list = list(poly_df['properties.Psuedo-Origin'])
-    uncertainty_list = list(poly_df['properties.Concentration Uncertainty (ppm m)'])
-    
+    # MMGIS backend 
+    with open(meta_path, 'r') as f: 
+        meta = json.loads(f.read())
+    meta_df = pd.json_normalize(meta['features'])
+    meta_df = meta_df[['properties.Plume ID', 'properties.fids', 'properties.Psuedo-Origin']]
+
     # Check to see if plume ID exists in json file 
-    curr_id = 'CH4_PlumeComplex-' + str(args.plume_id)
-    assert curr_id in plume_id_list, f'{"Plume ID "}{str(args.plume_id)}{" does not exist!"}'
-    
-    i = plume_id_list.index(curr_id)
-    json_flag = False
-    start = datetime.now()
-    plume_id = plume_id_list[i]
-    scene_fid = scene_fid_list[i]
-    conc_unc = uncertainty_list[i]
+    assert curr_id in list(meta_df['properties.Plume ID']), f'{str(curr_id)}{" does not exist!"}'
 
-    if len(pseudo_o_list[i]) > 0: 
-        pseudo_o = json.loads(pseudo_o_list[i])
-        json_flag = True
+    # Extract metadata for current complex_id
+    metadata = meta_df.iloc[meta_df[meta_df['properties.Plume ID'].str.contains(curr_id.strip())].index[0]]
 
-    if len(scene_fid) < 2: 
-        for fid in scene_fid:
-            curr_folder = os.path.join(fid[4:12], 'l2bch4plm')
-            curr_file = fid + '_' + plume_id + '.tif'
-            full_path = os.path.join(plume_path, curr_folder, curr_file)
+    # Check for missing pseudo-origin data 
+    if not (metadata['properties.Psuedo-Origin']):
+        print(curr_id + ' missing pseudo-origin data!\n')
+        return 
 
-            # Get plume metadata properties
-            sub_df = poly_df[poly_df['properties.Plume ID'] == plume_id]
-            obs = list(sub_df['properties.UTC Time Observed'])[0]
-            day = obs[8:10]
-            time = hour_round(obs[11:19])
-            year = obs[0:4]
-            month = obs[5:7]
+    # Read out metadata 
+    pseudo_o  = json.loads(metadata['properties.Psuedo-Origin'])["coordinates"]
+    plume_lat = pseudo_o[1]
+    plume_lon = pseudo_o[0]
+    conc_unc = 10e-6
+    scene_fid = metadata['properties.fids']
+    date = scene_fid[0][4:8] + "-" + scene_fid[0][8:10] + "-" + scene_fid[0][10:12]
+    time_str = scene_fid[0][13:15] + ":" + scene_fid[0][15:17] + ":" + scene_fid[0][17:19]
+    hour_rounded = hour_round(time_str)
 
-            # Load plume as 2D array
+    # Extract windspeed from Open-Meteo
+    u10_avg, u10_std = open_meteo_era5(plume_lat, plume_lon, date, hour_rounded)
+
+    # Open plume tifs
+    for fid in scene_fid:
+        curr_folder = os.path.join(fid[4:12], 'l2bch4plm')
+        curr_file = fid + '_' + curr_id.strip() + '.tif'
+        full_path = os.path.join(plume_path, curr_folder, curr_file)
+
+        if os.path.isfile(full_path): 
             with rasterio.open(full_path, 'r') as ds: 
                 plume_arr = ds.read().squeeze()
 
-            if json_flag and len(pseudo_o) > 0: 
-                coords = pseudo_o["coordinates"]
-                plume_lat = coords[1]
-                plume_lon = coords[0]
-                x_source, y_source = ~ds.transform * (plume_lon, plume_lat)
-
-            else: 
-                print('Using max concentration for plume origin!')
-                plume_lat = list(sub_df['properties.Latitude of max concentration'])[0]
-                plume_lon = list(sub_df['properties.Longitude of max concentration'])[0]
-                x_source, y_source = ~ds.transform * (plume_lon, plume_lat)
-
-    # IME/Q Calculations 
-    u10_avg, u10_std = access_era5(time, day, year, month, plume_lat, plume_lon, args.grib_path)
-    q_list, ime_list, min_radius = calc_q(plume_arr, full_path, u10_avg, u10_std, args.plume_id, x_source, y_source, conc_unc, args.gif)
-    
-    print('Threshold:', str(min_radius))
-    
-    plume_area = np.sum(plume_arr>0)
-    
-    # Write plume info to file
-    with open(os.path.join(args.out_path, args.out_name), 'a+', encoding='utf-8') as my_file:
-        my_file.write('Plume ID: ' + str(plume_id) + '\n')
-        my_file.write('Threshold: ' + str(min_radius) + '\n')
-        my_file.write('Plume Area: ' + str(plume_area) + '\n')
-        my_file.write('Max IME: ' + str(np.max(ime_list)) + '\n')
-        my_file.write('Max Q: ' + str(np.max(q_list)) + '\n')
-        my_file.write('Avg Windspeed: ' + str(u10_avg) + '\n')
-        my_file.write('Windspeed Unc: ' + str(u10_std) + '\n')
-        
-
-    
-######## FUNCTIONS ########
+            # Convert source to pixel coordinates
+            x_source, y_source = ~ds.transform * (plume_lon, plume_lat)
+            
+            return u10_avg, u10_std, x_source, y_source, full_path, plume_arr, fid, plume_lat, plume_lon 
 
 def open_meteo_era5(plume_lat, plume_lon, date, hour_rounded): 
+    """
+    plume_lat: pseudo-origin latitude [deg]
+    plume_lon: pseudo-origin longitude [deg]
+    date: str year-month-day e.g., "2024-03-05"
+    hour_rounded: e.g., 19:00:00
+
+    u10_avg: average 10 m windspeed over 0.75 x 0.75 deg square [m/s]
+    u10_std: standard deviation 10 m windspeed over 0.75 x 0.75 deg square [m/s]
+    """
+
     # Setup the Open-Meteo API client with cache and retry on error
     cache_session = requests_cache.CachedSession('.cache', expire_after = -1)
     retry_session = retry(cache_session, retries = 5, backoff_factor = 0.2)
@@ -215,91 +176,43 @@ def open_meteo_era5(plume_lat, plume_lon, date, hour_rounded):
     return u10_avg, u10_std
 
     
-def access_era5(time, day, year, month, plume_lat, plume_lon, save_path): 
-    """
-    ## Access ERA5 reanalysis data from CDSAPI (global)
-    """
-    
-    # Plume max concentration plus the nearest pixels on a 0.25 x 0.25 degree scale
-    plume_coords = [plume_lat,plume_lon, plume_lat+0.75, plume_lon+0.75, ]
-    fname_ext = '.grib'
-    fname = year + month + day + '_' + time + fname_ext
-    fname = os.path.join(save_path, fname)
-
-    if not os.path.exists(fname):     
-        return
-        print('Downloading new .grib file!')
-    
-        # Retrieve ERA5 from Climate Data Store (CDS) API 
-        c = cdsapi.Client()
-        c.retrieve(
-        'reanalysis-era5-single-levels',
-        {
-            'product_type': 'reanalysis',
-            'format': 'grib',
-            'day': day, 
-            'time': time,
-            'year': year,
-            'month': month,
-            'area': plume_coords,
-            'variable': [
-                '10m_u_component_of_wind',
-            ],
-        },
-        fname)
-    else:
-        print('Using pre-existing .grib file!')
-    
-    ds = xr.open_dataset(fname)
-    df = ds.to_dataframe()
-    u10_avg = np.abs(np.nanmean(df['u10'])) # Positive values = eastward 
-    u10_std = np.abs(np.nanstd(df['u10']))
-    
-    return u10_avg, u10_std
-
 def hour_round(time): 
     """
-    ## Round a time string to nearest UTC hour
+    Round a time string to nearest UTC hour
     """
     
     time_obj = datetime.strptime(time, '%H:%M:%S')
     nearest_hour = (time_obj + timedelta(minutes=30)).replace(minute=0, second=0)
     rounded_time = nearest_hour.strftime('%H:%M:%S')
+    
     return rounded_time[0:-3]
 
-def calc_ime(plume_arr, plume_path, dst_srs, plot = False): 
+def calc_ime_transect(plume_arr, p_s): 
     """
     plume_arr: 2-D array of plume enhancement data [ppmm]
-    plume_path: filepath to plume enhancement data
-    
+    p_s: dimensions of EMIT pixel [m^2]    
+
     ime: excess mass of CH4 in plume [kg]
-    p_s: dimensions of EMIT pixel [m^2]
     """
 
     # Get non-NaN pixels in a plume 
     plume_only = plume_arr[plume_arr!=-9999]
     
-    # IME calculation 
-    p_s = pixel_size(plume_path, dst_srs)
-    
+    # IME calculation     
     #     ppm(m)       m^2       L/m^3        mol/L      kg/mol
     k = (1.0/1e6)*((p_s)/1.0)*(1000.0/1.0)*(1.0/22.4)*(0.01604/1.0) # scaling factor from ppmm to kg CH4
     ime = plume_only.sum() * k 
     
-    if plot: 
-        plt.imshow(plume_arr)
-        plt.show()
-    
-    return ime, p_s
+    return ime
 
-def pixel_size(plume_path, dst_srs): 
+def pixel_size(full_path, dst_srs): 
     """
-    plume_path: filepath to plume enhancement data
-    
+    full_path: filepath to plume enhancement data
+    dst_srs: EPSG code 
+
     p_s: area dimensions of EMIT pixel [m^2]
     """
-    
-    proj_ds = gdal.Warp('', plume_path, dstSRS=dst_srs, format='VRT')
+    proj_ds = gdal.Warp('', full_path, dstSRS=dst_srs, format='VRT')
     transform_ds = proj_ds.GetGeoTransform()
     xsize_m = transform_ds[1]
     ysize_m = transform_ds[5]
@@ -307,7 +220,7 @@ def pixel_size(plume_path, dst_srs):
     
     return p_s 
 
-def contour_plume_UPDATE(plume_arr, plot = True): 
+def contour_plume(plume_arr, plot = False): 
     """
     plume_arr: 2-D array of plume enhancement data [ppmm]
     plot: boolean, plot plume and skeleton
@@ -378,7 +291,7 @@ def find_intersection(plume_arr, row_index, col_index):
     """
     
     # Find plume contour line and slope 
-    line_length, right_pt, left_pt = contour_plume_UPDATE(plume_arr, plot = False)
+    line_length, right_pt, left_pt = contour_plume(plume_arr)
         
     slope = (right_pt[1] - left_pt[1])/(right_pt[0] - left_pt[0])
     slope = -1/(slope + 10e-6)
@@ -409,22 +322,23 @@ def find_intersection(plume_arr, row_index, col_index):
 
     return intersection_points
 
-def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, conc_unc, gif, dst_srs = 'EPSG:3857'): 
+def calc_q_transect(plume_arr, p_s, u10, u10_std, x_source, y_source, mask_neg, gif = True): 
     """
-    plume_arr [float arr]: 2-D array of plume enhancement data [ppmm]
-    plume_path [str]: filepath to plume enhancement data
-    u10 [float]: 10 m near surface windspeed from re-analysis data 
-    x_source: x coordinate of plume source pixel
+    plume_arr: 2-D array of plume enhancement data [ppmm]
+    p_s: dimensions of EMIT pixel [m^2]    
+    u10_avg: average 10 m near surface windspeed [m/s]
+    u10_avg: standard deviation 10 m near surface windspeed [m/s]
+    x_source: x coordinate of plume source pixel 
     y_source: y coordinate of plume source pixel
-    conc_unc: scene-wise match-filter concentration uncertainty [ppmm] 
     gif [boolean]: gif of orthogonally transected plume 
     
-    q [float]: hourly plume emissions [kgCH4/hr]
-    ime [float]: excess mass of CH4 in plume [kg]
+    q_list: list of hourly plume emissions per transect [kgCH4/hr]
+    ime_list: list of excess mass of CH4 in plume per transect[kg]
+    rad_list: list of sub-transect fetch lengths from plume pseudo-origin [m]
     """
     
     # Get locations of plume skeleton line 
-    line_length, right_pt, left_pt = contour_plume_UPDATE(plume_arr, plot = False)
+    line_length, right_pt, left_pt = contour_plume(plume_arr, plot = False)
 
     # Rasterize line using Bresenham Line Algorithm
     indices = list(bresenham(right_pt[0], right_pt[1], left_pt[0], left_pt[1]))
@@ -442,12 +356,7 @@ def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, 
         del col_inds[index]
         
     # For each (row,ind) pair in the skeleton, orthogonally bisect the widest part 
-    q_list = []
-    rad_list = []
-    ime_list = []
-    q_unc_list = []
-    ime_unc_list = []
-    frames = []
+    q_list, rad_list, ime_list, frames = [], [], [], []
         
     if gif: 
         fig, ax = plt.subplots()
@@ -484,7 +393,8 @@ def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, 
         curr_plume_arr[mask] = -9999 
         
         # Mask out all negative MF values 
-        # curr_plume_arr = np.where(curr_plume_arr < 0, -9999, curr_plume_arr)
+        if mask_neg: 
+            curr_plume_arr = np.where(curr_plume_arr < 0, -9999, curr_plume_arr)
         
         # Only include subplumes where the source pixel is in the plume
         if curr_plume_arr[int(y_source), int(x_source)] != -9999:
@@ -495,42 +405,39 @@ def calc_q(plume_arr, plume_path, u10, u10_std, complex_id, x_source, y_source, 
                 frames.append([point, curr_fig])
 
             # IME/Q calculations
-            ime, p_s = calc_ime(curr_plume_arr, plume_path, dst_srs)
+            ime = calc_ime_transect(curr_plume_arr, p_s)
             plume_length = np.abs(math.dist([y_source, x_source],[row,col])) * np.sqrt(p_s)
-            q = (ime/plume_length) * u10 * 3600 
-            
-            # IME/Q uncertainty  
-            unc_mask = curr_plume_arr != -9999
-            unc_plume_arr = curr_plume_arr.copy()
-            unc_plume_arr[unc_mask] = conc_unc         
-            ime_unc, p_s = calc_ime(unc_plume_arr, plume_path, dst_srs)
-            q_unc = (ime_unc/plume_length) * u10 * 3600 
+            q = (ime/plume_length) * u10 * 3600          
 
             q_list.append(q)
             rad_list.append(plume_length)
-            ime_list.append(ime)
-            ime_unc_list.append(ime_unc)
-            q_unc_list.append(q_unc)
-     
-    # When is scenewide uncertainty >> than measured MF in ppmm 
-    plume_threshold_list = [a / b for a, b in zip(ime_list, ime_unc_list)]
-    
-    # Find highest value in rad_list where IME/IME uncertainty > 1 
-    min_radius = 0
-    for i in range(len(plume_threshold_list)): 
-        radius = rad_list[i]
-        thresh = plume_threshold_list[i]
-        if radius > min_radius and thresh > 1: 
-            min_radius = radius
-
-    if gif: 
-        # Display animation of concentric circles 
-        ani = animation.ArtistAnimation(fig, frames, interval=500, blit=True, repeat_delay=1000)
-        ani.save(os.path.join(plot_path,  str(complex_id) + '_plume_ani.gif'))
-        # display(Image(plot_path))
+            ime_list.append(ime)            
 
     return q_list, ime_list, rad_list
 
-    
+def create_plume_pdf(full_plume_id, meta_path, plot_path, plume_path, q_list, ime_list, rad_list):
+
+    _, _, x_source, y_source, _, plume_arr, fid, plume_lat, plume_lon  = get_plume_metadata(full_plume_id, meta_path, plume_path)
+    plume_img = np.where(plume_arr == -9999 , np.nan, plume_arr)
+                    
+    fig, ax = plt.subplots(1,2,figsize = (10,4))
+    ax[0].imshow(plume_img, vmin = 0, vmax = 1500, cmap = 'plasma')
+    ax[0].plot(x_source, y_source, marker='o', mfc='white', color = 'black', linestyle='', ms = 7)
+    ax[1].scatter(rad_list, ime_list, color = 'red')
+    ax[1].set(xlabel = 'Plume length [m]', ylabel = 'IME [kg]')
+    ax[1].tick_params(axis = 'y', color = 'red', labelcolor = 'red')
+    ax[1].set_ylabel('IME [kg]', color = 'red')
+    ax2 = ax[1].twinx()
+    ax2.scatter(rad_list, q_list, color = 'blue')
+    ax2.tick_params(axis = 'y', color = 'blue', labelcolor = 'blue')
+    ax2.set_ylabel('Q [kgCH4/hr]', color = 'blue')
+
+    fig.tight_layout(pad=2.0)
+    fig.suptitle(full_plume_id + '\n\n' + fid + '\n Pseudo-origin: (' + str(round(plume_lat,3)) + ', ' + str(round(plume_lon,3)) + ')', 
+                    y=1.2, x = 0.5, ha = 'center')                    
+    fig_path = os.path.join(plot_path, full_plume_id.strip() + '_transect.pdf')
+    fig.savefig(fig_path, bbox_inches='tight')
+    plt.close()
+
 if __name__ == '__main__':
     main()

@@ -12,6 +12,7 @@ def main(input_args=None):
     parser.add_argument('--plume_lat', type=float,  help='Latitude of plume pseudo-origin or desired windspeed location')
     parser.add_argument('--plume_lon', type=float,  help='Longitude of plume pseudo-origin or desired windspeed location')
     parser.add_argument('--fid', type=str, help='EMIT FID (e.g., emit20230614t102439)')
+    parser.add_argument('--save_path', type=str, default='/scratch/colemanr/Herbie_products', help='Save location for Herbie grib2 files')
     args = parser.parse_args(input_args)
 
     ## Get acquisition date + time from EMIT FID
@@ -19,14 +20,14 @@ def main(input_args=None):
     frac_time = float(args.fid[13:15]) + float(args.fid[15:17])/60 + float(args.fid[17:19])/3600
 
     # Call open-meteo and herbie APIs
-    u10_hrrr, u10_hrrr_stddev, u10_era5, u10_era5_stddev, u10_ecmwf, u10_ecmwf_stddev = get_u10_reanalysis(args.plume_lat, args.plume_lon, date, frac_time)
+    u10_hrrr, u10_hrrr_stddev, u10_era5, u10_era5_stddev, u10_ecmwf, u10_ecmwf_stddev = get_u10_reanalysis(args.plume_lat, args.plume_lon, date, frac_time, args.save_path)
     
     print(u10_hrrr, u10_hrrr_stddev, u10_era5, u10_era5_stddev, u10_ecmwf, u10_ecmwf_stddev)
     
     return u10_hrrr, u10_hrrr_stddev, u10_era5, u10_era5_stddev, u10_ecmwf, u10_ecmwf_stddev
     
 
-def herbie_hrrr(plume_lat, plume_lon, date, hour_rounded, curr_model = "hrrr"): 
+def herbie_hrrr(plume_lat, plume_lon, date, hour_rounded, save_path, curr_model = "hrrr"): 
     """
     plume_lat: pseudo-origin latitude [deg]
     plume_lon: pseudo-origin longitude [deg]
@@ -45,6 +46,7 @@ def herbie_hrrr(plume_lat, plume_lon, date, hour_rounded, curr_model = "hrrr"):
         date + ' ' + hour_rounded,  # model run date/time
         model="hrrr",  # model name
         fxx=0,  # forecast lead time
+        save_dir = save_path, 
         )
 
         # Subset xarray to U and V wind at 10-m above ground
@@ -122,7 +124,7 @@ def open_meteo_era5(plume_lat, plume_lon, date, hour_rounded, model, grid_size =
     
     return u10_avg, u10_std
 
-def get_u10_reanalysis(plume_lat, plume_lon, date, frac_time): 
+def get_u10_reanalysis(plume_lat, plume_lon, date, frac_time, save_path): 
     """
     plume_lat: pseudo-origin latitude [deg]
     plume_lon: pseudo-origin longitude [deg]
@@ -139,8 +141,8 @@ def get_u10_reanalysis(plume_lat, plume_lon, date, frac_time):
             
     # Check if source is in HRRR bounds
     if (21.13812300000003 <= plume_lat <= 52.61565330680793) and (225.90452026573686 <= plume_lon%360 <= 299.0828072281622): 
-        u10_avg_pre, u10_std_pre = herbie_hrrr(plume_lat, plume_lon%360, date, hour_rounded_pre)
-        u10_avg_post, u10_std_post = herbie_hrrr(plume_lat, plume_lon%360, date, hour_rounded_post)
+        u10_avg_pre, u10_std_pre = herbie_hrrr(plume_lat, plume_lon%360, date, hour_rounded_pre, save_path)
+        u10_avg_post, u10_std_post = herbie_hrrr(plume_lat, plume_lon%360, date, hour_rounded_post, save_path)
         u10_hrrr= np.interp(frac_time, [acq_time_pre, acq_time_post], [u10_avg_pre, u10_avg_post])
         u10_hrrr_stddev = np.interp(frac_time, [acq_time_pre, acq_time_post], [u10_std_pre, u10_std_post])
     else: 

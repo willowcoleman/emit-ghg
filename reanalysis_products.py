@@ -3,9 +3,9 @@ from herbie import Herbie
 import xarray as xr
 import openmeteo_requests
 import requests_cache
+import numpy as np
 from retry_requests import retry
 from openmeteo_sdk.Variable import Variable
-
 
 def main(input_args=None):
     parser = argparse.ArgumentParser(description="Retrieve HRRR, ERA5, ECMWF U10 reanalysis data")

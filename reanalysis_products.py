@@ -1,17 +1,10 @@
 import argparse
 from herbie import Herbie
 import xarray as xr
-import numpy as np
-import pandas as pd 
-import numpy as np
-import glob 
-import os
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 from openmeteo_sdk.Variable import Variable
-from emit_utils.file_checks import envi_header
-from spectral.io import envi
 
 
 def main(input_args=None):
